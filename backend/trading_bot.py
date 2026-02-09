@@ -10,11 +10,18 @@ import random
 from config import bot_state, config, DB_PATH
 from indices import get_index_config, round_to_strike
 from utils import get_ist_time, is_market_open, can_take_new_trade, should_force_squareoff, format_timeframe
-from indicators import SuperTrend, MACD
+from indicators import SuperTrend, MACD, ADX
 from score_engine import ScoreEngine, Candle
 from position_sizing import PositionSizingAgent
 from dhan_api import DhanAPI
 from database import save_trade, update_trade_exit
+
+# NEW: Comprehensive Trading Logic v2
+from market_regime_v2 import MarketRegimeDetector, MarketRegime
+from confidence_v2 import ConfidenceCalculator, ConfidenceLevel, ConfidenceBreakdown
+from entry_logic_v2 import EntryLogic, EntryDirection, EntryConfirmation, EntryDecision
+from exit_logic_v2 import ExitLogic, ExitReason, ExitSignal
+from cooldown_v2 import CooldownManager, CooldownReason, CooldownState
 
 logger = logging.getLogger(__name__)
 
@@ -33,6 +40,7 @@ class TradingBot:
         self.indicator = None  # Will hold selected indicator
         self.htf_indicator = None  # Higher-timeframe SuperTrend (e.g., 1m filter)
         self.macd = None  # LTF MACD for confirmation
+        self.adx = None  # Optional ADX(14) for regime detection
         self.score_engine = None  # Multi-timeframe score engine (optional)
         self._mds_last_direction = None
         self._mds_confirm_count = 0
@@ -51,6 +59,51 @@ class TradingBot:
         self._mds_htf_low = float('inf')
         self._mds_htf_close = 0.0
         self._initialize_indicator()
+
+        # ═══════════════════════════════════════════════════════════════════
+        # NEW: Comprehensive Trading Logic v2 Components
+        # ═══════════════════════════════════════════════════════════════════
+        
+        # Market Regime Detection (Gatekeeper)
+        self.regime_detector = MarketRegimeDetector(
+            use_adx=bool(config.get('use_adx_for_regime', False)),
+            adx_threshold=float(config.get('adx_threshold', 20.0))
+        )
+        
+        # Confidence Scoring Engine
+        self.confidence_calc = ConfidenceCalculator()
+        
+        # Entry Decision Logic
+        self.entry_logic = EntryLogic()
+        
+        # Exit Decision Logic (Risk First)
+        self.exit_logic = ExitLogic()
+        
+        # Cooldown Manager (Anti-Chop)
+        self.cooldown_mgr = CooldownManager(
+            cooldown_candles=int(config.get('cooldown_candles', 3))
+        )
+        
+        # Runtime confidence tracking during position hold
+        self.runtime_confidence = 100.0
+        
+        # Entry confidence recorded at time of entry
+        self.entry_confidence_recorded = 0.0
+        
+        # Track previous ST direction for flip detection
+        self.prev_st_direction = None
+        
+        # Track candles held in position
+        self.candles_in_position = 0
+        
+        # Track previous MACD histogram for trend detection
+        self.prev_macd_histogram = None
+
+        # Track recent candle ranges for volatility expansion scoring
+        self._recent_candle_ranges = []
+        
+        logger.info("[INIT] Trading Logic v2 initialized")
+        logger.info(f"[CONFIG] Regime: {self.regime_detector.use_adx and 'ADX' or 'ST Distance'} | Confidence Entry: {ConfidenceCalculator.MIN_ENTRY_CONFIDENCE} | Confidence Exit: {ConfidenceCalculator.MIN_RUNTIME_CONFIDENCE} | Cooldown: {self.cooldown_mgr.cooldown_duration} candles")
 
     def _prefetch_candles_needed(self) -> int:
         st_period = int(config.get('supertrend_period', 7) or 7)
@@ -215,6 +268,7 @@ class TradingBot:
         index_name: str,
         candle_number: int,
         candle_interval: int,
+        candle_open: float,
         high: float,
         low: float,
         close: float,
@@ -224,11 +278,16 @@ class TradingBot:
             return
 
         indicator_value, signal = self.indicator.add_candle(high, low, close)
-        macd_value = 0.0
+
+        # MACD: keep both line and histogram; entry spec uses histogram.
+        macd_line_value: Optional[float] = None
+        macd_hist_value: Optional[float] = None
         if self.macd:
-            macd_line, _macd_cross = self.macd.add_candle(high, low, close)
-            if macd_line is not None:
-                macd_value = float(macd_line)
+            _macd_line, _macd_cross = self.macd.add_candle(high, low, close)
+            if self.macd.last_macd is not None:
+                macd_line_value = float(self.macd.last_macd)
+            if self.macd.last_histogram is not None:
+                macd_hist_value = float(self.macd.last_histogram)
 
         mds_snapshot = None
         if config.get('indicator_type') == 'score_mds' and self.score_engine:
@@ -249,10 +308,21 @@ class TradingBot:
         # Update state if indicator is ready
         if indicator_value:
             bot_state['supertrend_value'] = indicator_value if isinstance(indicator_value, (int, float)) else str(indicator_value)
-        if self.macd and self.macd.last_macd is not None:
-            bot_state['macd_value'] = float(self.macd.last_macd)
+
+        # ADX update (optional; used by regime detector when enabled)
+        if self.adx:
+            try:
+                adx_val, _adx_sig = self.adx.add_candle(high, low, close)
+                bot_state['adx_value'] = None if adx_val is None else float(adx_val)
+            except Exception:
+                bot_state['adx_value'] = None
+        if macd_line_value is not None:
+            bot_state['macd_value'] = float(macd_line_value)
         else:
-            bot_state['macd_value'] = macd_value
+            bot_state['macd_value'] = 0.0
+
+        # Expose histogram as telemetry (used by v2 logic)
+        bot_state['macd_histogram'] = 0.0 if macd_hist_value is None else float(macd_hist_value)
 
         # Update signal status (GREEN="buy", RED="sell", None="waiting")
         if signal == "GREEN":
@@ -264,7 +334,7 @@ class TradingBot:
 
         # Always log candle close (even while indicators warm up)
         st_txt = f"{indicator_value:.2f}" if isinstance(indicator_value, (int, float)) else "NA"
-        macd_txt = f"{macd_value:.4f}" if isinstance(macd_value, (int, float)) else "NA"
+        macd_txt = f"{(macd_line_value or 0.0):.4f}" if isinstance(macd_line_value, (int, float)) else "NA"
         signal_txt = signal if signal else "NONE"
         logger.info(
             f"[CANDLE CLOSE #{candle_number}] {index_name} | "
@@ -295,6 +365,144 @@ class TradingBot:
             if sl_hit:
                 self.last_exit_candle_time = current_candle_time
 
+        # ═══════════════════════════════════════════════════════════════════
+        # NEW: Trading Logic v2 - Market Regime, Confidence, Entry/Exit
+        # ═══════════════════════════════════════════════════════════════════
+        
+        # v2 logic is always-on for SuperTrend-based modes.
+        # In score_mds mode, ScoreEngine has its own trade decisions; avoid double-trading.
+        use_v2_logic = str(config.get('indicator_type') or '').strip().lower() != 'score_mds'
+
+        if indicator_value and isinstance(indicator_value, (int, float)) and use_v2_logic:
+            current_price = float(bot_state.get('index_ltp') or 0.0)
+
+            # Track candle range history for volatility expansion
+            candle_range = float(high) - float(low)
+            if candle_range > 0:
+                self._recent_candle_ranges.append(candle_range)
+                if len(self._recent_candle_ranges) > 200:
+                    self._recent_candle_ranges = self._recent_candle_ranges[-200:]
+
+            # Market regime detection (gatekeeper)
+            regime, regime_info = self.regime_detector.detect(
+                current_price=current_price,
+                supertrend_value=float(indicator_value),
+                adx=float(bot_state.get('adx_value')) if bot_state.get('adx_value') is not None else None,
+            )
+            bot_state['market_regime'] = regime.value
+
+            # Cooldown advances on every candle
+            self.cooldown_mgr.advance()
+            cd_state = self.cooldown_mgr.get_state()
+            bot_state['cooldown_active'] = bool(cd_state.active)
+            bot_state['cooldown_candles_remaining'] = int(cd_state.candles_remaining)
+
+            # Candle body% (spec)
+            body_pct = 0.0
+            if float(high) != float(low):
+                body_pct = abs(float(close) - float(candle_open)) / (float(high) - float(low)) * 100.0
+
+            # Runtime: update confidence & evaluate exits if position open
+            if self.current_position:
+                self.candles_in_position += 1
+
+                new_conf, conf_reason = self.confidence_calc.calculate_runtime_confidence(
+                    previous_confidence=float(self.runtime_confidence),
+                    candle_body_pct=float(body_pct),
+                    macd_histogram=macd_hist_value,
+                    prev_macd_histogram=self.prev_macd_histogram,
+                    candles_held=int(self.candles_in_position),
+                )
+                self.runtime_confidence = float(new_conf)
+                bot_state['runtime_confidence'] = float(self.runtime_confidence)
+
+                # Risk-first exits (spec order)
+                option_ltp = float(bot_state.get('current_option_ltp') or 0.0)
+                position_type = str(self.current_position.get('option_type') or '').upper()
+                qty = int(self.current_position.get('qty') or 0)
+                if qty <= 0:
+                    index_config = get_index_config(index_name)
+                    qty = int(config.get('order_qty', 1) or 1) * int(index_config['lot_size'])
+
+                initial_sl = float(config.get('initial_stoploss', 0) or 0.0)
+                hard_sl = (float(self.entry_price) - initial_sl) if initial_sl > 0 else None
+
+                exit_signal = self.exit_logic.check_exit(
+                    is_open_position=True,
+                    current_option_ltp=option_ltp,
+                    hard_sl=hard_sl,
+                    trailing_sl=self.trailing_sl,
+                    runtime_confidence=float(self.runtime_confidence),
+                    min_runtime_confidence=float(config.get('min_runtime_confidence', 40.0) or 40.0),
+                    st_direction=int(self.indicator.direction) if self.indicator else None,
+                    prev_st_direction=int(self.prev_st_direction) if self.prev_st_direction is not None else None,
+                    position_type=position_type,
+                    current_time_ist=get_ist_time().time(),
+                    bypass_eod_exit=bool(config.get('bypass_market_hours', False)),
+                )
+
+                if exit_signal.should_exit and exit_signal.reason is not None:
+                    pnl = (option_ltp - float(self.entry_price)) * float(qty)
+                    logger.warning(f"[V2_EXIT] {exit_signal.reason.value} | Conf={self.runtime_confidence:.0f} ({conf_reason}) | BodyPct={body_pct:.0f} | PnL={pnl:.2f}")
+                    closed = await self.close_position(option_ltp, pnl, exit_signal.reason.value)
+                    if closed:
+                        self.last_exit_candle_time = current_candle_time
+
+            # Entry: only if no open position AND not in cooldown AND trending regime
+            else:
+                self.candles_in_position = 0
+
+                if regime == MarketRegime.SIDEWAYS:
+                    logger.debug("[V2_ENTRY] Skipped (SIDEWAYS regime)")
+                elif not self.cooldown_mgr.can_enter():
+                    logger.debug("[V2_ENTRY] Skipped (cooldown active)")
+                elif not self.is_within_trading_hours() or bool(bot_state.get('daily_max_loss_triggered', False)):
+                    logger.debug("[V2_ENTRY] Skipped (hours/maxloss gate)")
+                else:
+                    st_distance_pct = (abs(current_price - float(indicator_value)) / current_price * 100.0) if current_price > 0 else 0.0
+
+                    confidence_bd = self.confidence_calc.calculate_entry_confidence(
+                        supertrend_distance_pct=float(st_distance_pct),
+                        candle_open=float(candle_open),
+                        candle_high=float(high),
+                        candle_low=float(low),
+                        candle_close=float(close),
+                        macd_histogram=macd_hist_value,
+                        recent_ranges=list(self._recent_candle_ranges),
+                    )
+                    bot_state['confidence_entry'] = float(confidence_bd.total)
+                    logger.info(f"[V2_ENTRY_CONF] {confidence_bd}")
+
+                    entry_decision = self.entry_logic.check_entry(
+                        market_regime_is_trending=True,
+                        st_direction=int(self.indicator.direction),
+                        prev_st_direction=int(self.prev_st_direction) if self.prev_st_direction is not None else None,
+                        supertrend_value=float(indicator_value),
+                        candle_close=float(close),
+                        macd_histogram=macd_hist_value,
+                        entry_confidence=float(confidence_bd.total),
+                        min_entry_confidence=float(config.get('min_entry_confidence', 65.0) or 65.0),
+                    )
+
+                    if entry_decision.should_enter and entry_decision.direction is not None:
+                        option_type = 'CE' if entry_decision.direction == EntryDirection.BULLISH else 'PE'
+                        atm_strike = round_to_strike(current_price, index_name)
+                        logger.info(f"[V2_ENTRY] YES | {option_type} | ATM={atm_strike} | Conf={confidence_bd.total:.0f}")
+                        await self.enter_position(option_type, atm_strike, current_price)
+                        self.entry_confidence_recorded = float(confidence_bd.total)
+                        self.runtime_confidence = 100.0
+                        self.candles_in_position = 0
+                    else:
+                        logger.debug(f"[V2_ENTRY] NO | Reason={entry_decision.reason} | Conf={confidence_bd.total:.0f}")
+
+            # Track previous MACD histogram and ST direction
+            self.prev_macd_histogram = macd_hist_value
+            self.prev_st_direction = int(self.indicator.direction)
+
+        # ═══════════════════════════════════════════════════════════════════
+        # END: Trading Logic v2
+        # ═══════════════════════════════════════════════════════════════════
+
         # Score-engine trading path (independent of SuperTrend signal emission)
         if config.get('indicator_type') == 'score_mds' and mds_snapshot is not None:
             can_trade = True
@@ -307,6 +515,10 @@ class TradingBot:
                 if exited:
                     self.last_exit_candle_time = current_candle_time
         else:
+            # Prevent double-trading: v2 is authoritative for SuperTrend-based modes.
+            if str(config.get('indicator_type') or '').strip().lower() != 'score_mds':
+                return
+
             prev_signal = bot_state.get('last_supertrend_signal')
             flipped = bool(signal) and (prev_signal is None or signal != prev_signal)
             if signal:
@@ -426,6 +638,9 @@ class TradingBot:
                 signal=int(config.get('macd_signal', 9)),
             )
 
+            # Optional: ADX for market regime detection
+            self.adx = ADX(period=14) if bool(config.get('use_adx_for_regime', False)) else None
+
             self.score_engine = ScoreEngine(
                 st_period=int(config.get('supertrend_period', 7)),
                 st_multiplier=float(config.get('supertrend_multiplier', 4)),
@@ -444,6 +659,7 @@ class TradingBot:
             self.indicator = SuperTrend(period=7, multiplier=4)
             self.htf_indicator = SuperTrend(period=7, multiplier=4)
             self.macd = MACD(fast=12, slow=26, signal=9)
+            self.adx = ADX(period=14) if bool(config.get('use_adx_for_regime', False)) else None
             self.score_engine = ScoreEngine(
                 st_period=7,
                 st_multiplier=4,
@@ -465,6 +681,8 @@ class TradingBot:
             self.htf_indicator.reset()
         if self.macd:
             self.macd.reset()
+        if self.adx:
+            self.adx.reset()
         if self.score_engine:
             self.score_engine.reset()
         else:
@@ -491,7 +709,17 @@ class TradingBot:
         self._mds_htf_high = 0.0
         self._mds_htf_low = float('inf')
         self._mds_htf_close = 0.0
+        
+        # NEW: Reset Trading Logic v2 State
+        self.runtime_confidence = 100.0
+        self.entry_confidence_recorded = 0.0
+        self.prev_st_direction = None
+        self.candles_in_position = 0
+        self.prev_macd_histogram = None
+        self.cooldown_mgr.reset()
+        
         logger.info(f"[SIGNAL] Indicator reset: {config.get('indicator_type', 'supertrend')}")
+        logger.info("[SIGNAL] Trading Logic v2 state reset")
     
     def is_within_trading_hours(self) -> bool:
         """Check if current time allows new entries
@@ -725,6 +953,15 @@ class TradingBot:
         self.highest_profit = 0
         self.entry_time_utc = None
 
+        # NEW: v2 cooldown activates after ANY exit (spec: mandatory cooldown)
+        try:
+            self.cooldown_mgr.activate(reason=CooldownReason.EXIT)
+            state = self.cooldown_mgr.get_state()
+            bot_state['cooldown_active'] = bool(state.active)
+            bot_state['cooldown_candles_remaining'] = int(state.candles_remaining)
+        except Exception:
+            pass
+
         logger.info(f"[EXIT] ✓ Position closed | {index_name} {option_type} {strike} | Reason: {reason} | PnL: {pnl:.2f} | Order Placed: {exit_order_placed}")
         return True
     
@@ -732,6 +969,7 @@ class TradingBot:
         """Main trading loop"""
         logger.info("[BOT] Trading loop started")
         candle_start_time = datetime.now()
+        candle_open = 0.0
         high, low, close = 0, float('inf'), 0
         candle_number = 0
 
@@ -790,11 +1028,12 @@ class TradingBot:
                     self._paper_replay_pos += 1
 
                     try:
+                        candle_open = float(row.get('open') or row.get('close') or 0.0)
                         high = float(row.get('high') or 0.0)
                         low = float(row.get('low') or float('inf'))
                         close = float(row.get('close') or 0.0)
                     except Exception:
-                        high, low, close = 0.0, float('inf'), 0.0
+                        candle_open, high, low, close = 0.0, 0.0, float('inf'), 0.0
 
                     # Treat candle close price as current LTP
                     if close > 0:
@@ -831,61 +1070,20 @@ class TradingBot:
                             htf_high, htf_low, htf_close = 0, float('inf'), 0
                             self._paper_replay_htf_elapsed = 0
 
-                    # Score/indicator update on every replay candle
+                    # Unified candle-close logic (v2 regime/entry/exit/cooldown)
                     candle_number += 1
                     if high > 0 and low < float('inf'):
-                        indicator_value, signal = self.indicator.add_candle(high, low, close)
-                        macd_value = 0.0
-                        if self.macd:
-                            macd_line, _macd_cross = self.macd.add_candle(high, low, close)
-                            if macd_line is not None:
-                                macd_value = float(macd_line)
-
-                        mds_snapshot = None
-                        if config.get('indicator_type') == 'score_mds' and self.score_engine:
-                            try:
-                                mds_snapshot = self.score_engine.on_base_candle(Candle(high=float(high), low=float(low), close=float(close)))
-                                bot_state['mds_score'] = float(mds_snapshot.score)
-                                bot_state['mds_slope'] = float(mds_snapshot.slope)
-                                bot_state['mds_acceleration'] = float(mds_snapshot.acceleration)
-                                bot_state['mds_stability'] = float(mds_snapshot.stability)
-                                bot_state['mds_confidence'] = float(mds_snapshot.confidence)
-                                bot_state['mds_is_choppy'] = bool(mds_snapshot.is_choppy)
-                                bot_state['mds_direction'] = str(mds_snapshot.direction)
-                            except Exception as e:
-                                logger.error(f"[MDS] ScoreEngine update failed: {e}", exc_info=True)
-                                mds_snapshot = None
-
-                        if indicator_value:
-                            bot_state['supertrend_value'] = indicator_value if isinstance(indicator_value, (int, float)) else str(indicator_value)
-                            bot_state['macd_value'] = macd_value
-                            if signal == "GREEN":
-                                bot_state['signal_status'] = "buy"
-                            elif signal == "RED":
-                                bot_state['signal_status'] = "sell"
-                            else:
-                                bot_state['signal_status'] = "waiting"
-
-                        # Candle-close trading logic
                         current_candle_time = datetime.now()
-                        if self.current_position:
-                            option_ltp = bot_state['current_option_ltp']
-                            sl_hit = await self.check_trailing_sl_on_close(option_ltp)
-                            if sl_hit:
-                                self.last_exit_candle_time = current_candle_time
-
-                        if config.get('indicator_type') == 'score_mds' and mds_snapshot is not None:
-                            exited = await self.process_mds_on_close(mds_snapshot, close)
-                            if exited:
-                                self.last_exit_candle_time = current_candle_time
-                        else:
-                            if signal:
-                                prev_signal = bot_state.get('last_supertrend_signal')
-                                flipped = prev_signal is None or signal != prev_signal
-                                bot_state['last_supertrend_signal'] = signal
-                                exited = await self.process_signal_on_close(signal, close, flipped=flipped)
-                                if exited:
-                                    self.last_exit_candle_time = current_candle_time
+                        await self._handle_closed_candle(
+                            index_name=index_name,
+                            candle_number=candle_number,
+                            candle_interval=int(config.get('candle_interval', candle_interval) or candle_interval),
+                            candle_open=float(candle_open or close or 0.0),
+                            high=high,
+                            low=low,
+                            close=close,
+                            current_candle_time=current_candle_time,
+                        )
 
                     # Update simulated option pricing if needed
                     if self.current_position:
@@ -1033,6 +1231,7 @@ class TradingBot:
                                 index_name=index_name,
                                 candle_number=candle_number,
                                 candle_interval=int(config.get('candle_interval', candle_interval) or candle_interval),
+                                candle_open=float(mds_new_candle.get('open') or close or 0.0) if isinstance(mds_new_candle, dict) else float(close or 0.0),
                                 high=high,
                                 low=low,
                                 close=close,
@@ -1091,6 +1290,8 @@ class TradingBot:
                 # Update candle data
                 index_ltp = bot_state['index_ltp']
                 if provider != 'mds' and index_ltp > 0:
+                    if candle_open <= 0:
+                        candle_open = float(index_ltp)
                     if index_ltp > high:
                         high = index_ltp
                     if index_ltp < low:
@@ -1147,6 +1348,7 @@ class TradingBot:
                     if tick_exit:
                         # Position exited on tick, reset candle for next entry
                         candle_start_time = datetime.now()
+                        candle_open = 0.0
                         high, low, close = 0, float('inf'), 0
                         candle_number = 0
                         await asyncio.sleep(1)
@@ -1162,6 +1364,7 @@ class TradingBot:
                         index_name=index_name,
                         candle_number=candle_number,
                         candle_interval=int(config.get('candle_interval', candle_interval) or candle_interval),
+                        candle_open=float(candle_open or close or bot_state.get('index_ltp') or 0.0),
                         high=high,
                         low=low,
                         close=close,
@@ -1170,6 +1373,7 @@ class TradingBot:
 
                     # Reset candle for next period
                     candle_start_time = datetime.now()
+                    candle_open = 0.0
                     high, low, close = 0, float('inf'), 0
                 
                 # Handle paper mode simulation
@@ -1217,6 +1421,9 @@ class TradingBot:
         """Broadcast current state to WebSocket clients"""
         from server import manager
         
+        # GET cooldown state for broadcast
+        cooldown_state = self.cooldown_mgr.get_state()
+        
         await manager.broadcast({
             "type": "state_update",
             "data": {
@@ -1245,6 +1452,15 @@ class TradingBot:
                 "candle_interval": config['candle_interval'],
                 "htf_filter_enabled": bool(config.get('htf_filter_enabled', True)),
                 "htf_filter_timeframe": int(config.get('htf_filter_timeframe', 60)),
+                
+                # NEW: Trading Logic v2 Metrics
+                "market_regime": bot_state.get('market_regime', 'UNKNOWN'),
+                "entry_confidence": self.entry_confidence_recorded,
+                "runtime_confidence": self.runtime_confidence,
+                "cooldown_active": cooldown_state.is_active,
+                "cooldown_candles_remaining": cooldown_state.candles_remaining,
+                "cooldown_reason": cooldown_state.reason.value if cooldown_state.reason else None,
+                
                 "timestamp": datetime.now(timezone.utc).isoformat()
             }
         })
